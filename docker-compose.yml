@@ -1,0 +1,141 @@
+version: '3.8'
+
+services:
+  # --- INFRAESTRUTURA DE BROKERS (MALHA P2P) ---
+  broker1:
+    build:
+      context: .
+      args:
+        TARGET: broker
+    container_name: broker-setor-1
+    environment:
+      - BROKER_ID=1
+      - BROKER_PORT=:9000
+      - PEERS=broker-setor-2:9000,broker-setor-3:9000,broker-setor-4:9000
+    networks:
+      - ormuz-net
+
+  broker2:
+    build:
+      context: .
+      args:
+        TARGET: broker
+    container_name: broker-setor-2
+    environment:
+      - BROKER_ID=2
+      - BROKER_PORT=:9000
+      - PEERS=broker-setor-1:9000,broker-setor-3:9000,broker-setor-4:9000
+    networks:
+      - ormuz-net
+
+  broker3:
+    build:
+      context: .
+      args:
+        TARGET: broker
+    container_name: broker-setor-3
+    environment:
+      - BROKER_ID=3
+      - BROKER_PORT=:9000
+      - PEERS=broker-setor-1:9000,broker-setor-2:9000,broker-setor-4:9000
+    networks:
+      - ormuz-net
+
+  broker4:
+    build:
+      context: .
+      args:
+        TARGET: broker
+    container_name: broker-setor-4
+    environment:
+      - BROKER_ID=4
+      - BROKER_PORT=:9000
+      - PEERS=broker-setor-1:9000,broker-setor-2:9000,broker-setor-3:9000
+    networks:
+      - ormuz-net
+
+  # --- SENSORES MARÍTIMOS (GERAÇÃO DE CARGA) ---
+  sensor1:
+    build:
+      context: .
+      args:
+        TARGET: sensor
+    environment:
+      - BROKER_ADDR=broker-setor-1:9000
+      - SETOR_ID=1
+    depends_on:
+      - broker1
+    networks:
+      - ormuz-net
+
+  sensor2:
+    build:
+      context: .
+      args:
+        TARGET: sensor
+    environment:
+      - BROKER_ADDR=broker-setor-2:9000
+      - SETOR_ID=2
+    depends_on:
+      - broker2
+    networks:
+      - ormuz-net
+
+  sensor3:
+    build:
+      context: .
+      args:
+        TARGET: sensor
+    environment:
+      - BROKER_ADDR=broker-setor-3:9000
+      - SETOR_ID=3
+    depends_on:
+      - broker3
+    networks:
+      - ormuz-net
+
+  sensor4:
+    build:
+      context: .
+      args:
+        TARGET: sensor
+    environment:
+      - BROKER_ADDR=broker-setor-4:9000
+      - SETOR_ID=4
+    depends_on:
+      - broker4
+    networks:
+      - ormuz-net
+
+  # --- DRONES AUTÔNOMOS (RECURSOS COMPARTILHADOS) ---
+  drone_alpha:
+    build:
+      context: .
+      args:
+        TARGET: drone
+    environment:
+      - DRONE_ID=ALPHA
+      - BROKER_ADDRS=broker-setor-1:9000,broker-setor-2:9000,broker-setor-3:9000,broker-setor-4:9000
+    depends_on:
+      - broker1
+      - broker2
+    networks:
+      - ormuz-net
+
+  drone_bravo:
+    build:
+      context: .
+      args:
+        TARGET: drone
+    environment:
+      - DRONE_ID=BRAVO
+      - BROKER_ADDRS=broker-setor-1:9000,broker-setor-2:9000,broker-setor-3:9000,broker-setor-4:9000
+    depends_on:
+      - broker1
+      - broker2
+    networks:
+      - ormuz-net
+
+networks:
+  ormuz-net:
+    driver: bridge
