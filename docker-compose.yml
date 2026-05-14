@@ -1,0 +1,105 @@
+services:
+  # -------------------------------------------------------
+  # BROKERS — cada um expõe uma porta diferente no host
+  # broker1 = :9000 (seed, sem SEED_ADDR)
+  # broker2 = :9001 (entra via broker1)
+  # broker3 = :9002 (entra via broker1)
+  # -------------------------------------------------------
+  broker1:
+    build:
+      context: .
+      args:
+        TARGET: broker
+    container_name: broker-1
+    ports:
+      - "9000:9000"
+    environment:
+      - BROKER_ID=1
+      - BROKER_PORT=:9000
+      - MY_ADDR=${ADDR_BROKER_1}
+    networks:
+      - ormuz-net
+
+  broker2:
+    build:
+      context: .
+      args:
+        TARGET: broker
+    container_name: broker-2
+    ports:
+      - "9001:9000"
+    environment:
+      - BROKER_ID=2
+      - BROKER_PORT=:9000
+      - MY_ADDR=${ADDR_BROKER_2}
+      - SEED_ADDR=${SEED_ADDR}
+    networks:
+      - ormuz-net
+
+  broker3:
+    build:
+      context: .
+      args:
+        TARGET: broker
+    container_name: broker-3
+    ports:
+      - "9002:9000"
+    environment:
+      - BROKER_ID=3
+      - BROKER_PORT=:9000
+      - MY_ADDR=${ADDR_BROKER_3}
+      - SEED_ADDR=${SEED_ADDR}
+    networks:
+      - ormuz-net
+
+  sensor_setor_1:
+    build:
+      context: .
+      args:
+        TARGET: sensor
+    container_name: sensor-1
+    environment:
+      - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3}
+      - SETOR_ID=1
+    networks:
+      - ormuz-net
+
+  sensor_setor_2:
+    build:
+      context: .
+      args:
+        TARGET: sensor
+    container_name: sensor-2
+    environment:
+      - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3}
+      - SETOR_ID=2
+    networks:
+      - ormuz-net
+
+  drone_alpha:
+    build:
+      context: .
+      args:
+        TARGET: drone
+    container_name: drone-alpha
+    environment:
+      - DRONE_ID=ALPHA
+      - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3}
+    networks:
+      - ormuz-net
+
+  drone_bravo:
+    build:
+      context: .
+      args:
+        TARGET: drone
+    container_name: drone-bravo
+    environment:
+      - DRONE_ID=BRAVO
+      - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3}
+    networks:
+      - ormuz-net
+
+networks:
+  ormuz-net:
+    driver: bridge
