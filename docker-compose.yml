@@ -59,7 +59,7 @@ services:
         TARGET: sensor
     container_name: sensor-1
     environment:
-      - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3}
+      - BROKER_ADDRS=${ADDR_BROKER_1}
       - SETOR_ID=1
     networks:
       - ormuz-net
@@ -71,8 +71,20 @@ services:
         TARGET: sensor
     container_name: sensor-2
     environment:
-      - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3}
+      - BROKER_ADDRS=${ADDR_BROKER_2}
       - SETOR_ID=2
+    networks:
+      - ormuz-net
+
+  sensor_setor_3:
+    build:
+      context: .
+      args:
+        TARGET: sensor
+    container_name: sensor-3
+    environment:
+      - BROKER_ADDRS=${ADDR_BROKER_3}
+      - SETOR_ID=3
     networks:
       - ormuz-net
 
@@ -96,6 +108,18 @@ services:
     container_name: drone-bravo
     environment:
       - DRONE_ID=BRAVO
+      - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3}
+    networks:
+      - ormuz-net
+
+  drone_novo:
+    build:
+      context: .
+      args:
+        TARGET: drone
+    container_name: drone-novo
+    environment:
+      - DRONE_ID=NOVO
       - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3}
     networks:
       - ormuz-net

@@ -215,6 +215,13 @@ func (b *Broker) processarHeartbeat(msg models.MensagemDistribuida) {
 		}
 	}
 	b.mu.Unlock()
+
+	// CORREÇÃO: Se a mensagem veio do drone (SenderID == 0),
+	// o broker propaga o sinal de vida para manter toda a malha sincronizada.
+	if msg.SenderID == 0 {
+		msg.SenderID = b.ID
+		go b.broadcast(msg)
+	}
 }
 
 // processarConclusaoDrone marca a missão como concluída e propaga o update.
@@ -339,13 +346,6 @@ func (b *Broker) solicitarEntrada(seedAddr string) {
 }
 
 // processarJoin é chamado quando recebemos MsgJoin de um broker novato.
-//
-// CORRIGIDO:
-//  1. Responde ao novato com MsgJoinACK antes de fechar a conn.
-//  2. Só envia FullSync se este broker foi o receptor direto (é o seed).
-//     Identificado verificando se a conn veio de fora (não via broadcast).
-//     Como o broadcast repropaga o Join, usamos uma flag no payload para
-//     distinguir: quem fecha a conn com o novato é o receptor direto.
 func (b *Broker) processarJoin(msg models.MensagemDistribuida, conn net.Conn) {
 	pBytes, _ := json.Marshal(msg.Payload)
 	var reqJoin models.JoinRequest
@@ -359,37 +359,40 @@ func (b *Broker) processarJoin(msg models.MensagemDistribuida, conn net.Conn) {
 	}
 	b.mu.Unlock()
 
-	// CORRIGIDO: responde com MsgJoinACK contendo nossos próprios dados,
-	// para que o novato possa nos adicionar como peer.
-	ack := models.MensagemDistribuida{
-		Tipo:      models.MsgJoinACK,
-		SenderID:  b.ID,
-		Timestamp: b.Relogio,
-		Payload: models.JoinRequest{
-			ID:   b.ID,
-			Addr: b.MeuEndereco,
-		},
-	}
-	json.NewEncoder(conn).Encode(ack)
-	conn.Close() // podemos fechar após responder
+	// CORREÇÃO: Disca ativamente para o novato para enviar o ACK de apresentação.
+	// Assim, mesmo os brokers que souberam dele via broadcast conseguem se conectar.
+	go func() {
+		connDir, err := net.DialTimeout("tcp", reqJoin.Addr, 2*time.Second)
+		// CORRIGIDO DE "==" PARA "!="
+		if err != nil {
+			fmt.Printf("[ERRO-JOIN] Falha ao devolver ACK para o novato em %s: %v\n", reqJoin.Addr, err)
+			return
+		}
+		ack := models.MensagemDistribuida{
+			Tipo:      models.MsgJoinACK,
+			SenderID:  b.ID,
+			Timestamp: b.Relogio,
+			Payload: models.JoinRequest{
+				ID:   b.ID,
+				Addr: b.MeuEndereco,
+			},
+		}
+		json.NewEncoder(connDir).Encode(ack)
+		connDir.Close()
+	}() // CHAVE REMOVIDA DAQUI - a função principal continua
+
+	conn.Close() // Fecha a conexão de quem avisou
 
 	if !jaConhece {
-		// Propaga o Join para que o resto da malha também conheça o novato.
-		// CORRIGIDO: broadcast NÃO envia de volta para o novato (ele não está nos
-		// Peers de ninguém ainda além do seed); os outros brokers processarão o
-		// Join, adicionarão o novato, e responderão com seu próprio ACK.
-		// O novato acumulará os peers via FullSync do seed.
+		// Se o SenderID for igual ao do novato, fomos a semente procurada diretamente
+		sementeDireta := (msg.SenderID == reqJoin.ID)
+
+		// Propaga para o resto da malha atualizando o SenderID para evitar loop
+		msg.SenderID = b.ID
 		go b.broadcast(msg)
 
-		// Envia o estado atual (lista de missões) para o novato via FullSync.
-		// Somente o receptor direto do Join faz isso (o seed), pois a conn
-		// acima fechou após o ACK. Para os demais brokers que receberem o
-		// Join via broadcast, o recipient será o próprio broker que originou
-		// o broadcast (msg.SenderID != reqJoin.ID pois o SenderID será o
-		// broker que reencaminhou). CORRIGIDO: verificamos se quem enviou
-		// a msg é o próprio novato (SenderID == reqJoin.ID), ou seja, se
-		// é a mensagem original e não um reencaminhamento.
-		if msg.SenderID == reqJoin.ID {
+		// Apenas a semente envia o estado completo para não floodar a rede
+		if sementeDireta {
 			go b.enviarEstadoParaNovato(reqJoin.Addr)
 		}
 	}
@@ -569,10 +572,6 @@ func (b *Broker) solicitarMissao(conn net.Conn, droneID string) {
 }
 
 // responderRicartAgrawala avalia se devemos conceder ou negar o OK ao broker solicitante.
-//
-// CORRIGIDO: compara o timestamp da PENDÊNCIA LOCAL (se existir) com o remoto,
-// não o relógio atual. Isso implementa corretamente o algoritmo R-A:
-// "Eu nego o OK apenas se eu também quero a CS E minha requisição tem prioridade."
 func (b *Broker) responderRicartAgrawala(msg models.MensagemDistribuida) {
 	missionID, ok := msg.Payload.(string)
 	if !ok {
@@ -609,11 +608,15 @@ func (b *Broker) enviarOK(destID int, missionID string) {
 	b.mu.Unlock()
 
 	if !ok {
+		// LOG NOVO: Se ele não conhecer o par, ele avisa em vez de ignorar
+		fmt.Printf("[ERRO-RA] Não conheço o endereço do Broker %d para enviar OK!\n", destID)
 		return
 	}
 
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
+		// LOG NOVO: Se a rede bloquear, saberemos na hora
+		fmt.Printf("[ERRO-RA] Falha ao enviar OK para Broker %d (%s): %v\n", destID, addr, err)
 		return
 	}
 	defer conn.Close()
