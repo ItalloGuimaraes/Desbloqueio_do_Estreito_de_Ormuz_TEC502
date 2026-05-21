@@ -39,7 +39,7 @@ services:
         TARGET: broker
     container_name: broker-3
     ports:
-      - "9002:9000"
+      - "9003:9000"
     environment:
       - BROKER_ID=3
       - BROKER_PORT=:9000
