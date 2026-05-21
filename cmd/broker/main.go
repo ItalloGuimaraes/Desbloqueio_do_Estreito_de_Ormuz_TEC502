@@ -18,27 +18,25 @@ import (
 // =========================================================
 
 type Broker struct {
-	ID               int
-	Porta            string
-	MeuEndereco      string // IP:Porta externamente acessível nesta máquina
-	Relogio          int64
-	ListaDistribuida []models.Requisicao
-	Peers            map[int]string // map[brokerID]"ip:porta"
-	mu               sync.Mutex
+	ID                 int
+	Porta              string
+	MeuEndereco        string
+	Relogio            int64
+	ListaDistribuida   []models.Requisicao
+	Peers              map[int]string
+	FalhasConsecutivas map[int]int
+	mu                 sync.Mutex
 }
 
-// PendenciaAgrawala representa uma solicitação de CS em andamento (Ricart-Agrawala).
-// Armazena o timestamp LOCAL da requisição para comparação correta com remotas.
 type PendenciaAgrawala struct {
 	MissionID      string
-	TimestampLocal int64 // CORRIGIDO: timestamp desta requisição (não o relógio atual)
-	Respostas      int
-	TotalEsperado  int // captura len(Peers) no momento da requisição
+	TimestampLocal int64
+	Respostas      map[int]bool // Previne duplicação de OKs do mesmo broker
+	TotalEsperado  int
 	DroneConn      net.Conn
 	DroneID        string
 }
 
-// pendencias é global pois é acessada em múltiplas goroutines; protegida por broker.mu
 var pendencias = make(map[string]*PendenciaAgrawala)
 
 // =========================================================
@@ -50,8 +48,6 @@ func (b *Broker) tickRelogio() int64 {
 	return b.Relogio
 }
 
-// atualizarRelogio implementa a regra de Lamport: max(local, remoto) + 1.
-// Deve ser chamado FORA de b.mu (adquire o lock internamente).
 func (b *Broker) atualizarRelogio(remoteTimestamp int64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -65,8 +61,6 @@ func (b *Broker) atualizarRelogio(remoteTimestamp int64) {
 // Ordenação da fila
 // =========================================================
 
-// ordenarLista ordena por: prioridade desc → timestamp asc → brokerID asc.
-// Deve ser chamado com b.mu já adquirido.
 func (b *Broker) ordenarLista() {
 	sort.Slice(b.ListaDistribuida, func(i, j int) bool {
 		r1, r2 := b.ListaDistribuida[i], b.ListaDistribuida[j]
@@ -81,12 +75,12 @@ func (b *Broker) ordenarLista() {
 }
 
 // =========================================================
-// Comunicação P2P
+// Comunicação P2P (PARALELA / FAN-OUT)
 // =========================================================
 
-// broadcast envia msg para todos os peers conhecidos, exceto si mesmo.
-// Usa uma cópia dos peers para não segurar o lock durante I/O de rede.
-func (b *Broker) broadcast(msg models.MensagemDistribuida) {
+const limiteFalhas = 3
+
+func (b *Broker) broadcast(msg models.MensagemDistribuida) (enviados int, removidos []int) {
 	b.mu.Lock()
 	peersCopia := make(map[int]string, len(b.Peers))
 	for id, addr := range b.Peers {
@@ -94,20 +88,54 @@ func (b *Broker) broadcast(msg models.MensagemDistribuida) {
 	}
 	b.mu.Unlock()
 
+	var wg sync.WaitGroup
+	var envMu sync.Mutex
+	removidos = []int{}
+
 	for id, addr := range peersCopia {
 		if id == b.ID {
 			continue
 		}
-		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
-		if err != nil {
-			fmt.Printf("[P2P] Falha ao contatar Broker %d (%s): %v\n", id, addr, err)
-			continue
-		}
-		if err := json.NewEncoder(conn).Encode(msg); err != nil {
-			fmt.Printf("[P2P] Erro ao enviar para Broker %d: %v\n", id, err)
-		}
-		conn.Close()
+		wg.Add(1)
+
+		go func(peerID int, peerAddr string) {
+			defer wg.Done()
+			conn, err := net.DialTimeout("tcp", peerAddr, 2*time.Second)
+			if err != nil {
+				b.mu.Lock()
+				b.FalhasConsecutivas[peerID]++
+				falhas := b.FalhasConsecutivas[peerID]
+				b.mu.Unlock()
+
+				if falhas >= limiteFalhas {
+					b.mu.Lock()
+					delete(b.Peers, peerID)
+					delete(b.FalhasConsecutivas, peerID)
+					b.mu.Unlock()
+
+					envMu.Lock()
+					removidos = append(removidos, peerID)
+					envMu.Unlock()
+					fmt.Printf("[P2P] Broker %d removido após %d falhas.\n", peerID, falhas)
+				}
+				return
+			}
+
+			b.mu.Lock()
+			b.FalhasConsecutivas[peerID] = 0
+			b.mu.Unlock()
+
+			if err := json.NewEncoder(conn).Encode(msg); err == nil {
+				envMu.Lock()
+				enviados++
+				envMu.Unlock()
+			}
+			conn.Close()
+		}(id, addr)
 	}
+
+	wg.Wait()
+	return enviados, removidos
 }
 
 // =========================================================
@@ -136,7 +164,6 @@ func (b *Broker) Iniciar() {
 }
 
 func (b *Broker) handleConnection(conn net.Conn) {
-	// IMPORTANTE: não fechar a conn aqui; cada case decide quando fechar.
 	var msg models.MensagemDistribuida
 	if err := json.NewDecoder(conn).Decode(&msg); err != nil {
 		conn.Close()
@@ -148,60 +175,64 @@ func (b *Broker) handleConnection(conn net.Conn) {
 
 	switch msg.Tipo {
 	case models.MsgJoin:
-		// CORRIGIDO: passa conn para que processarJoin possa responder antes de fechar
 		b.processarJoin(msg, conn)
-
 	case models.MsgJoinACK:
-		// NOVO: resposta do seed com seus dados (ID + addr)
 		b.processarJoinACK(msg)
 		conn.Close()
-
 	case models.MsgSyncNew:
 		b.processarNovoAlerta(msg)
 		conn.Close()
-
 	case models.MsgSyncUpdate:
 		b.processarUpdateStatus(msg)
 		conn.Close()
-
 	case models.MsgFullSync:
 		b.receberSincronizacaoCompleta(msg)
 		conn.Close()
-
 	case models.MsgReqDrone:
 		if msg.SenderID == 0 {
-			// Veio de um drone (não participa da malha P2P)
-			droneID, _ := msg.Payload.(string)
+			var droneID string
+			if s, ok := msg.Payload.(string); ok {
+				droneID = s
+			} else {
+				pBytes, _ := json.Marshal(msg.Payload)
+				json.Unmarshal(pBytes, &droneID)
+			}
 			b.solicitarMissao(conn, droneID)
-			// conn será fechada dentro de solicitarMissao / confirmarMissaoAoDrone
 		} else {
-			// Veio de outro broker — protocolo Ricart-Agrawala
 			b.responderRicartAgrawala(msg)
 			conn.Close()
 		}
-
 	case models.MsgReplyOK:
 		b.processarReplyOK(msg)
 		conn.Close()
-
 	case models.MsgDroneHeartbeat:
 		b.processarHeartbeat(msg)
 		conn.Close()
-
 	case models.MsgDroneConcluido:
 		b.processarConclusaoDrone(msg)
 		conn.Close()
-
+	case models.MsgConsultaFila:
+		b.responderConsultaFila(conn)
 	default:
 		conn.Close()
 	}
+}
+
+func (b *Broker) responderConsultaFila(conn net.Conn) {
+	defer conn.Close()
+	b.mu.Lock()
+	copia := make([]models.Requisicao, len(b.ListaDistribuida))
+	copy(copia, b.ListaDistribuida)
+	b.mu.Unlock()
+
+	resposta := models.RespostaFila{Requisicoes: copia}
+	json.NewEncoder(conn).Encode(resposta)
 }
 
 // =========================================================
 // Heartbeat e recuperação de falha de drone
 // =========================================================
 
-// processarHeartbeat atualiza o timestamp do último sinal do drone na missão.
 func (b *Broker) processarHeartbeat(msg models.MensagemDistribuida) {
 	pBytes, _ := json.Marshal(msg.Payload)
 	var status models.DroneStatus
@@ -215,63 +246,61 @@ func (b *Broker) processarHeartbeat(msg models.MensagemDistribuida) {
 		}
 	}
 	b.mu.Unlock()
-
-	// CORREÇÃO: Se a mensagem veio do drone (SenderID == 0),
-	// o broker propaga o sinal de vida para manter toda a malha sincronizada.
-	if msg.SenderID == 0 {
-		msg.SenderID = b.ID
-		go b.broadcast(msg)
-	}
 }
 
-// processarConclusaoDrone marca a missão como concluída e propaga o update.
 func (b *Broker) processarConclusaoDrone(msg models.MensagemDistribuida) {
 	pBytes, _ := json.Marshal(msg.Payload)
 	var status models.DroneStatus
 	json.Unmarshal(pBytes, &status)
 
 	b.mu.Lock()
+	var broadcastMsg *models.MensagemDistribuida
 	for i := range b.ListaDistribuida {
 		if b.ListaDistribuida[i].ID == status.MissionID {
 			b.ListaDistribuida[i].Status = models.StatusConcluido
 			tarefa := b.ListaDistribuida[i]
-			fmt.Printf("[MISSÃO] %s CONCLUÍDA pelo drone %s\n", status.MissionID, status.DroneID)
-			go b.broadcast(models.MensagemDistribuida{
+			fmt.Printf("[CONCLUÍDO] Drone %-6s → %s | Alerta: \"%s\" | Setor %d\n",
+				tarefa.DroneID, tarefa.ID, tarefa.Descricao, tarefa.Setor)
+			m := models.MensagemDistribuida{
 				Tipo:     models.MsgSyncUpdate,
 				SenderID: b.ID,
 				Payload:  tarefa,
-			})
+			}
+			broadcastMsg = &m
 			break
 		}
 	}
 	b.mu.Unlock()
+
+	if broadcastMsg != nil {
+		go b.broadcast(*broadcastMsg)
+	}
 }
 
-// processoWatchdogDrones monitora missões em andamento.
-// Se um drone não enviar heartbeat por mais de 10s, a missão volta para PENDENTE.
 func (b *Broker) processoWatchdogDrones() {
 	ticker := time.NewTicker(5 * time.Second)
 	go func() {
 		for range ticker.C {
+			var parabroadcast []models.MensagemDistribuida
 			b.mu.Lock()
 			for i := range b.ListaDistribuida {
 				req := &b.ListaDistribuida[i]
 				if req.Status != models.StatusEmAtendimento {
 					continue
 				}
-				// Missão sem heartbeat por mais de 10s → drone caiu
 				semHeartbeat := req.UltimoHeartbeat.IsZero() ||
-					time.Since(req.UltimoHeartbeat) > 10*time.Second
-				// Mas só considera falha se a missão já tem mais de 10s
-				// (evita falso positivo logo após despacho)
-				missaoAntiga := time.Since(req.CreatedAt) > 10*time.Second
-				if semHeartbeat && missaoAntiga {
-					fmt.Printf("[WATCHDOG-DRONE] Drone %s não responde! Missão %s devolvida à fila.\n",
-						req.DroneID, req.ID)
+					time.Since(req.UltimoHeartbeat) > 15*time.Second
+				droneJaAssumiu := !req.IniciadoEm.IsZero() &&
+					time.Since(req.IniciadoEm) > 15*time.Second
+
+				if semHeartbeat && droneJaAssumiu {
+					fmt.Printf("[WATCHDOG] Drone %-6s falhou | %s devolvida à fila | Alerta: \"%s\"\n",
+						req.DroneID, req.ID, req.Descricao)
 					req.Status = models.StatusPendente
 					req.DroneID = ""
+					req.IniciadoEm = time.Time{}
 					req.UltimoHeartbeat = time.Time{}
-					go b.broadcast(models.MensagemDistribuida{
+					parabroadcast = append(parabroadcast, models.MensagemDistribuida{
 						Tipo:     models.MsgSyncUpdate,
 						SenderID: b.ID,
 						Payload:  *req,
@@ -279,6 +308,10 @@ func (b *Broker) processoWatchdogDrones() {
 				}
 			}
 			b.mu.Unlock()
+
+			for _, bMsg := range parabroadcast {
+				go b.broadcast(bMsg)
+			}
 		}
 	}()
 }
@@ -287,16 +320,8 @@ func (b *Broker) processoWatchdogDrones() {
 // DINAMISMO: Entrada de novos Brokers (Join P2P)
 // =========================================================
 
-// solicitarEntrada é chamado por brokers com SEED_ADDR configurado.
-// Envia MsgJoin ao seed e aguarda MsgJoinACK com os dados do seed,
-// adicionando-o como peer conhecido.
-//
-// CORRIGIDO: agora lê a resposta do seed (MsgJoinACK) para descobrir
-//
-//	o ID e endereço do seed e adicioná-lo aos próprios Peers.
 func (b *Broker) solicitarEntrada(seedAddr string) {
 	fmt.Printf("[JOIN] Tentando entrar na malha via semente: %s\n", seedAddr)
-
 	conn, err := net.DialTimeout("tcp", seedAddr, 5*time.Second)
 	if err != nil {
 		fmt.Printf("[ERRO] Falha ao conectar na semente %s: %v\n", seedAddr, err)
@@ -320,16 +345,13 @@ func (b *Broker) solicitarEntrada(seedAddr string) {
 	}
 
 	if err := json.NewEncoder(conn).Encode(joinMsg); err != nil {
-		fmt.Printf("[ERRO] Falha ao enviar MsgJoin: %v\n", err)
 		return
 	}
-	fmt.Printf("[JOIN] MsgJoin enviada para %s\n", seedAddr)
 
-	// CORRIGIDO: aguarda ACK do seed com seus dados (ID + addr)
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	var ack models.MensagemDistribuida
 	if err := json.NewDecoder(conn).Decode(&ack); err != nil {
-		fmt.Printf("[JOIN] Sem ACK do seed (pode ser broker legado): %v\n", err)
+		fmt.Printf("[ERRO] Sem resposta síncrona do seed %s: %v\n", seedAddr, err)
 		return
 	}
 
@@ -340,66 +362,66 @@ func (b *Broker) solicitarEntrada(seedAddr string) {
 
 		b.mu.Lock()
 		b.Peers[seedInfo.ID] = seedInfo.Addr
+		b.FalhasConsecutivas[seedInfo.ID] = 0
 		fmt.Printf("[JOIN] Seed %d (%s) adicionado aos Peers\n", seedInfo.ID, seedInfo.Addr)
 		b.mu.Unlock()
 	}
 }
 
-// processarJoin é chamado quando recebemos MsgJoin de um broker novato.
 func (b *Broker) processarJoin(msg models.MensagemDistribuida, conn net.Conn) {
 	pBytes, _ := json.Marshal(msg.Payload)
 	var reqJoin models.JoinRequest
 	json.Unmarshal(pBytes, &reqJoin)
 
+	if reqJoin.ID == b.ID {
+		conn.Close()
+		return
+	}
+
 	b.mu.Lock()
 	_, jaConhece := b.Peers[reqJoin.ID]
 	if !jaConhece {
 		b.Peers[reqJoin.ID] = reqJoin.Addr
+		b.FalhasConsecutivas[reqJoin.ID] = 0
 		fmt.Printf("[P2P] Novo Broker %d adicionado: %s\n", reqJoin.ID, reqJoin.Addr)
 	}
 	b.mu.Unlock()
 
-	// CORREÇÃO: Disca ativamente para o novato para enviar o ACK de apresentação.
-	// Assim, mesmo os brokers que souberam dele via broadcast conseguem se conectar.
-	go func() {
-		connDir, err := net.DialTimeout("tcp", reqJoin.Addr, 2*time.Second)
-		// CORRIGIDO DE "==" PARA "!="
-		if err != nil {
-			fmt.Printf("[ERRO-JOIN] Falha ao devolver ACK para o novato em %s: %v\n", reqJoin.Addr, err)
-			return
-		}
-		ack := models.MensagemDistribuida{
-			Tipo:      models.MsgJoinACK,
-			SenderID:  b.ID,
-			Timestamp: b.Relogio,
-			Payload: models.JoinRequest{
-				ID:   b.ID,
-				Addr: b.MeuEndereco,
-			},
-		}
-		json.NewEncoder(connDir).Encode(ack)
-		connDir.Close()
-	}() // CHAVE REMOVIDA DAQUI - a função principal continua
+	ack := models.MensagemDistribuida{
+		Tipo:      models.MsgJoinACK,
+		SenderID:  b.ID,
+		Timestamp: b.Relogio,
+		Payload:   models.JoinRequest{ID: b.ID, Addr: b.MeuEndereco},
+	}
 
-	conn.Close() // Fecha a conexão de quem avisou
+	// CORREÇÃO CRÍTICA DO APERTO DE MÃO:
+	// Se fomos contactados diretamente, respondemos na mesma conexão para garantir a entrega síncrona.
+	if msg.SenderID == reqJoin.ID {
+		json.NewEncoder(conn).Encode(ack)
+	} else {
+		// Se soubemos via fofoca (broadcast), discamos de forma assíncrona.
+		go func(targetAddr string) {
+			connDir, err := net.DialTimeout("tcp", targetAddr, 2*time.Second)
+			if err == nil {
+				json.NewEncoder(connDir).Encode(ack)
+				connDir.Close()
+			}
+		}(reqJoin.Addr)
+	}
+
+	conn.Close()
 
 	if !jaConhece {
-		// Se o SenderID for igual ao do novato, fomos a semente procurada diretamente
-		sementeDireta := (msg.SenderID == reqJoin.ID)
+		msgPropagada := msg
+		msgPropagada.SenderID = b.ID
+		go b.broadcast(msgPropagada)
 
-		// Propaga para o resto da malha atualizando o SenderID para evitar loop
-		msg.SenderID = b.ID
-		go b.broadcast(msg)
-
-		// Apenas a semente envia o estado completo para não floodar a rede
-		if sementeDireta {
+		if msg.SenderID == reqJoin.ID {
 			go b.enviarEstadoParaNovato(reqJoin.Addr)
 		}
 	}
 }
 
-// processarJoinACK lida com a resposta do seed.
-// Adicionamos o seed (e futuros peers que se anunciarem) à nossa lista.
 func (b *Broker) processarJoinACK(msg models.MensagemDistribuida) {
 	pBytes, _ := json.Marshal(msg.Payload)
 	var info models.JoinRequest
@@ -408,19 +430,16 @@ func (b *Broker) processarJoinACK(msg models.MensagemDistribuida) {
 	b.mu.Lock()
 	if _, existe := b.Peers[info.ID]; !existe {
 		b.Peers[info.ID] = info.Addr
+		b.FalhasConsecutivas[info.ID] = 0
 		fmt.Printf("[P2P] Peer %d (%s) adicionado via ACK\n", info.ID, info.Addr)
 	}
 	b.mu.Unlock()
 }
 
-// enviarEstadoParaNovato envia a lista completa de missões (FullSync) ao novo broker.
 func (b *Broker) enviarEstadoParaNovato(addr string) {
-	// Pequena pausa para garantir que o novato já está ouvindo após receber o ACK
 	time.Sleep(500 * time.Millisecond)
-
 	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
 	if err != nil {
-		fmt.Printf("[SYNC] Falha ao enviar FullSync para %s: %v\n", addr, err)
 		return
 	}
 	defer conn.Close()
@@ -435,10 +454,8 @@ func (b *Broker) enviarEstadoParaNovato(addr string) {
 	b.mu.Unlock()
 
 	json.NewEncoder(conn).Encode(msg)
-	fmt.Printf("[SYNC] FullSync enviado para %s\n", addr)
 }
 
-// receberSincronizacaoCompleta substitui a lista local pela recebida do seed.
 func (b *Broker) receberSincronizacaoCompleta(msg models.MensagemDistribuida) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -462,7 +479,7 @@ func (b *Broker) processarNovoAlerta(msg models.MensagemDistribuida) {
 	json.Unmarshal(pBytes, &req)
 
 	b.mu.Lock()
-	origemLocal := msg.Timestamp == 0 // Timestamp 0 = veio diretamente de um sensor
+	origemLocal := msg.Timestamp == 0
 	if origemLocal {
 		b.Relogio++
 		req.Timestamp = b.Relogio
@@ -476,7 +493,6 @@ func (b *Broker) processarNovoAlerta(msg models.MensagemDistribuida) {
 	b.ordenarLista()
 	b.mu.Unlock()
 
-	// Propaga apenas se originou aqui (evita loop de broadcast)
 	if origemLocal {
 		msg.Timestamp = req.Timestamp
 		msg.SenderID = b.ID
@@ -495,6 +511,20 @@ func (b *Broker) processarUpdateStatus(msg models.MensagemDistribuida) {
 		if r.ID == update.ID {
 			b.ListaDistribuida[i].Status = update.Status
 			b.ListaDistribuida[i].DroneID = update.DroneID
+
+			// LÓGICA FAIL-FAST: Se outro broker assumiu a missão, desistimos dela instantaneamente!
+			if update.Status == models.StatusEmAtendimento {
+				b.ListaDistribuida[i].IniciadoEm = time.Now()
+				b.ListaDistribuida[i].UltimoHeartbeat = time.Now()
+
+				if pend, existe := pendencias[update.ID]; existe {
+					fmt.Printf("[R-A] A missão %s foi assumida por outro. Recalculando...\n", update.ID)
+					droneConn := pend.DroneConn
+					droneID := pend.DroneID
+					delete(pendencias, update.ID)
+					go b.solicitarMissao(droneConn, droneID)
+				}
+			}
 			break
 		}
 	}
@@ -504,15 +534,16 @@ func (b *Broker) processarUpdateStatus(msg models.MensagemDistribuida) {
 // Ricart-Agrawala — exclusão mútua distribuída
 // =========================================================
 
-// solicitarMissao é chamado quando um drone pede uma missão.
-// Inicia o protocolo Ricart-Agrawala com os peers e aguarda respostas.
 func (b *Broker) solicitarMissao(conn net.Conn, droneID string) {
 	b.mu.Lock()
 	var alvo *models.Requisicao
 	for i := range b.ListaDistribuida {
 		if b.ListaDistribuida[i].Status == models.StatusPendente {
-			alvo = &b.ListaDistribuida[i]
-			break
+			// Não tentar negociar o que já está a ser negociado
+			if _, jaNegociando := pendencias[b.ListaDistribuida[i].ID]; !jaNegociando {
+				alvo = &b.ListaDistribuida[i]
+				break
+			}
 		}
 	}
 
@@ -525,53 +556,73 @@ func (b *Broker) solicitarMissao(conn net.Conn, droneID string) {
 
 	b.Relogio++
 	timestampLocal := b.Relogio
+	idMissao := alvo.ID
 
-	// CORRIGIDO: guarda o timestamp da requisição e o total de peers no momento
-	totalPeers := len(b.Peers)
+	totalPeers := 0
+	for id := range b.Peers {
+		if id != b.ID {
+			totalPeers++
+		}
+	}
+
 	pendencia := &PendenciaAgrawala{
-		MissionID:      alvo.ID,
+		MissionID:      idMissao,
 		TimestampLocal: timestampLocal,
-		Respostas:      0,
+		Respostas:      make(map[int]bool),
 		TotalEsperado:  totalPeers,
 		DroneConn:      conn,
 		DroneID:        droneID,
 	}
-	pendencias[alvo.ID] = pendencia
+	pendencias[idMissao] = pendencia
 
 	if totalPeers == 0 {
-		fmt.Printf("[R-A] Sem peers. Missão %s autorizada de imediato.\n", alvo.ID)
+		fmt.Printf("[R-A] Sem peers. Missão %s autorizada de imediato.\n", idMissao)
 		go b.confirmarMissaoAoDrone(pendencia)
-		delete(pendencias, alvo.ID)
+		delete(pendencias, idMissao)
 		b.mu.Unlock()
 		return
 	}
 	b.mu.Unlock()
 
-	// Watchdog: se após 5s não chegaram todas as respostas, prossegue mesmo assim
-	// (tolerância a falhas em ambiente de redes instáveis como o descrito no PBL)
-	go func(p *PendenciaAgrawala, idMissao string) {
+	go func(idM string) {
 		time.Sleep(5 * time.Second)
 		b.mu.Lock()
-		if pend, existe := pendencias[idMissao]; existe {
+		if pend, existe := pendencias[idM]; existe {
 			fmt.Printf("[WATCHDOG] Timeout com %d/%d respostas. Confirmando missão %s.\n",
-				pend.Respostas, pend.TotalEsperado, idMissao)
+				len(pend.Respostas), pend.TotalEsperado, idM)
 			go b.confirmarMissaoAoDrone(pend)
-			delete(pendencias, idMissao)
+			delete(pendencias, idM)
 		}
 		b.mu.Unlock()
-	}(pendencia, alvo.ID)
+	}(idMissao)
 
-	// Broadcast do pedido de CS para todos os peers
 	reqMsg := models.MensagemDistribuida{
 		Tipo:      models.MsgReqDrone,
 		SenderID:  b.ID,
 		Timestamp: timestampLocal,
-		Payload:   alvo.ID,
+		Payload:   idMissao,
 	}
-	go b.broadcast(reqMsg)
+
+	entregues, _ := b.broadcast(reqMsg)
+	falhasDeEnvio := totalPeers - entregues
+
+	b.mu.Lock()
+	if pend, existe := pendencias[idMissao]; existe {
+		pend.TotalEsperado -= falhasDeEnvio
+
+		if pend.TotalEsperado <= 0 {
+			fmt.Printf("[R-A] Todos os peers inativos. Missão %s autorizada.\n", idMissao)
+			go b.confirmarMissaoAoDrone(pend)
+			delete(pendencias, idMissao)
+		} else if len(pend.Respostas) >= pend.TotalEsperado {
+			fmt.Printf("[R-A] Todos os OKs recebidos (%d/%d). Confirmando missão %s.\n", len(pend.Respostas), pend.TotalEsperado, idMissao)
+			go b.confirmarMissaoAoDrone(pend)
+			delete(pendencias, idMissao)
+		}
+	}
+	b.mu.Unlock()
 }
 
-// responderRicartAgrawala avalia se devemos conceder ou negar o OK ao broker solicitante.
 func (b *Broker) responderRicartAgrawala(msg models.MensagemDistribuida) {
 	missionID, ok := msg.Payload.(string)
 	if !ok {
@@ -579,14 +630,9 @@ func (b *Broker) responderRicartAgrawala(msg models.MensagemDistribuida) {
 	}
 
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	okParaEnviar := true
 
 	if pendLocal, existe := pendencias[missionID]; existe {
-		// Temos uma pendência para a mesma missão.
-		// Regra R-A: nega OK se nosso timestamp for menor (mais antigo = prioridade)
-		// ou se empate no timestamp, nosso ID for menor.
 		meTemPrioridade := pendLocal.TimestampLocal < msg.Timestamp ||
 			(pendLocal.TimestampLocal == msg.Timestamp && b.ID < msg.SenderID)
 		if meTemPrioridade {
@@ -596,27 +642,26 @@ func (b *Broker) responderRicartAgrawala(msg models.MensagemDistribuida) {
 		}
 	}
 
-	if okParaEnviar {
-		b.enviarOK(msg.SenderID, missionID)
+	destAddr := ""
+	if addr, existe := b.Peers[msg.SenderID]; existe {
+		destAddr = addr
 	}
-}
-
-func (b *Broker) enviarOK(destID int, missionID string) {
-	b.mu.Lock()
-	addr, ok := b.Peers[destID]
 	ts := b.Relogio
 	b.mu.Unlock()
 
-	if !ok {
-		// LOG NOVO: Se ele não conhecer o par, ele avisa em vez de ignorar
-		fmt.Printf("[ERRO-RA] Não conheço o endereço do Broker %d para enviar OK!\n", destID)
-		return
+	if okParaEnviar {
+		if destAddr != "" {
+			b.enviarOKParaAddr(destAddr, ts, missionID)
+		} else {
+			// LOG DE ALERTA: Agora saberemos se alguém sofreu amnésia de IPs!
+			fmt.Printf("[R-A] ALERTA: Não consigo enviar OK para Broker %d porque o IP dele sumiu da minha lista!\n", msg.SenderID)
+		}
 	}
+}
 
+func (b *Broker) enviarOKParaAddr(addr string, ts int64, missionID string) {
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
-		// LOG NOVO: Se a rede bloquear, saberemos na hora
-		fmt.Printf("[ERRO-RA] Falha ao enviar OK para Broker %d (%s): %v\n", destID, addr, err)
 		return
 	}
 	defer conn.Close()
@@ -629,51 +674,73 @@ func (b *Broker) enviarOK(destID int, missionID string) {
 	})
 }
 
-// processarReplyOK contabiliza os OKs recebidos.
-// Quando todos os peers responderam, confirma a missão ao drone.
 func (b *Broker) processarReplyOK(msg models.MensagemDistribuida) {
 	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	missionID, ok := msg.Payload.(string)
-	if ok {
-		if p, existe := pendencias[missionID]; existe {
-			p.Respostas++
-			fmt.Printf("[R-A] OK de Broker %d para missão %s (%d/%d)\n",
-				msg.SenderID, missionID, p.Respostas, p.TotalEsperado)
-			if p.Respostas >= p.TotalEsperado {
-				go b.confirmarMissaoAoDrone(p)
-				delete(pendencias, missionID)
-			}
+	if !ok {
+		pBytes, _ := json.Marshal(msg.Payload)
+		json.Unmarshal(pBytes, &missionID)
+		if missionID == "" {
+			return
 		}
 	}
-	b.mu.Unlock()
+
+	p, existe := pendencias[missionID]
+	if !existe {
+		return
+	}
+
+	p.Respostas[msg.SenderID] = true
+	votosAtuais := len(p.Respostas)
+
+	fmt.Printf("[R-A] OK de Broker %d para missão %s (%d/%d)\n",
+		msg.SenderID, missionID, votosAtuais, p.TotalEsperado)
+
+	if p.TotalEsperado > 0 && votosAtuais >= p.TotalEsperado {
+		go b.confirmarMissaoAoDrone(p)
+		delete(pendencias, missionID)
+	}
 }
 
-// confirmarMissaoAoDrone atualiza o status da missão e notifica o drone.
 func (b *Broker) confirmarMissaoAoDrone(p *PendenciaAgrawala) {
 	defer p.DroneConn.Close()
+
 	b.mu.Lock()
+	var tarefa models.Requisicao
+	var encontrou bool
 	for i, r := range b.ListaDistribuida {
 		if r.ID == p.MissionID {
 			b.ListaDistribuida[i].Status = models.StatusEmAtendimento
 			b.ListaDistribuida[i].DroneID = p.DroneID
-			tarefa := b.ListaDistribuida[i]
-
-			if err := json.NewEncoder(p.DroneConn).Encode(tarefa); err != nil {
-				fmt.Printf("[DRONE] Erro ao enviar missão ao drone %s: %v\n", p.DroneID, err)
-			} else {
-				fmt.Printf("[DRONE] Missão %s despachada para drone %s\n", p.MissionID, p.DroneID)
-			}
-
-			go b.broadcast(models.MensagemDistribuida{
-				Tipo:      models.MsgSyncUpdate,
-				SenderID:  b.ID,
-				Timestamp: b.Relogio,
-				Payload:   tarefa,
-			})
+			b.ListaDistribuida[i].IniciadoEm = time.Now()
+			b.ListaDistribuida[i].UltimoHeartbeat = time.Now()
+			tarefa = b.ListaDistribuida[i]
+			encontrou = true
 			break
 		}
 	}
 	b.mu.Unlock()
+
+	if !encontrou {
+		return
+	}
+
+	if err := json.NewEncoder(p.DroneConn).Encode(tarefa); err != nil {
+		fmt.Printf("[DRONE] Erro ao enviar missão ao drone %s: %v\n", p.DroneID, err)
+		return
+	}
+
+	fmt.Printf("[DESPACHO] Drone %-6s <- %s | Alerta: \"%s\" | Setor %d | Prioridade %d\n",
+		p.DroneID, p.MissionID, tarefa.Descricao, tarefa.Setor, tarefa.Prioridade)
+
+	go b.broadcast(models.MensagemDistribuida{
+		Tipo:      models.MsgSyncUpdate,
+		SenderID:  b.ID,
+		Timestamp: b.Relogio,
+		Payload:   tarefa,
+	})
 }
 
 // =========================================================
@@ -705,6 +772,36 @@ func (b *Broker) processoEnvelhecimento() {
 }
 
 // =========================================================
+// Reconexão automática à malha
+// =========================================================
+
+func (b *Broker) processoReconexao(seeds []string) {
+	time.Sleep(2 * time.Second)
+	for {
+		b.mu.Lock()
+		temPeer := len(b.Peers) > 0
+		b.mu.Unlock()
+
+		if !temPeer {
+			fmt.Printf("[RECONEXAO] Sem peers. Tentando seeds: %v\n", seeds)
+			for _, seed := range seeds {
+				b.solicitarEntrada(seed)
+
+				b.mu.Lock()
+				temPeer = len(b.Peers) > 0
+				b.mu.Unlock()
+
+				if temPeer {
+					fmt.Printf("[RECONEXAO] Conectado com sucesso via %s\n", seed)
+					break
+				}
+			}
+		}
+		time.Sleep(10 * time.Second)
+	}
+}
+
+// =========================================================
 // Ponto de entrada
 // =========================================================
 
@@ -713,20 +810,33 @@ func main() {
 	porta := os.Getenv("BROKER_PORT")
 	peersStr := os.Getenv("PEERS")
 	seedAddr := os.Getenv("SEED_ADDR")
+	seedAddrs := os.Getenv("SEED_ADDRS")
 	meuEndereco := os.Getenv("MY_ADDR")
 
 	if porta == "" {
 		porta = ":9000"
 	}
 
-	broker := &Broker{
-		ID:          id,
-		Porta:       porta,
-		MeuEndereco: meuEndereco,
-		Peers:       make(map[int]string),
+	var seeds []string
+	raw := seedAddrs
+	if raw == "" {
+		raw = seedAddr
+	}
+	for _, s := range strings.Split(raw, ",") {
+		s = strings.TrimSpace(s)
+		if s != "" && s != meuEndereco {
+			seeds = append(seeds, s)
+		}
 	}
 
-	// Parsing de peers estáticos (opcional, para topologias fixas)
+	broker := &Broker{
+		ID:                 id,
+		Porta:              porta,
+		MeuEndereco:        meuEndereco,
+		Peers:              make(map[int]string),
+		FalhasConsecutivas: make(map[int]int),
+	}
+
 	if peersStr != "" {
 		for i, p := range strings.Split(peersStr, ",") {
 			p = strings.TrimSpace(p)
@@ -740,12 +850,10 @@ func main() {
 		}
 	}
 
-	// DINAMISMO: solicita entrada na malha via seed após a porta estar aberta
-	if seedAddr != "" && meuEndereco != "" {
-		go func() {
-			time.Sleep(2 * time.Second) // aguarda Iniciar() abrir a porta
-			broker.solicitarEntrada(seedAddr)
-		}()
+	if len(seeds) > 0 && meuEndereco != "" {
+		go broker.processoReconexao(seeds)
+		fmt.Println(">>> Aguardando estabilização da malha P2P (3s)...")
+		time.Sleep(3 * time.Second)
 	}
 
 	fmt.Printf(">>> Broker %d iniciando na porta %s | externo: %s\n", broker.ID, porta, meuEndereco)

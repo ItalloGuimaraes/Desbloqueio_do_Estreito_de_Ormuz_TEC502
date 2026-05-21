@@ -1,10 +1,5 @@
 services:
-  # -------------------------------------------------------
-  # BROKERS — cada um expõe uma porta diferente no host
-  # broker1 = :9000 (seed, sem SEED_ADDR)
-  # broker2 = :9001 (entra via broker1)
-  # broker3 = :9002 (entra via broker1)
-  # -------------------------------------------------------
+
   broker1:
     build:
       context: .
@@ -17,6 +12,7 @@ services:
       - BROKER_ID=1
       - BROKER_PORT=:9000
       - MY_ADDR=${ADDR_BROKER_1}
+      - SEED_ADDRS=${ADDR_BROKER_2},${ADDR_BROKER_3},${ADDR_BROKER_4}
     networks:
       - ormuz-net
 
@@ -32,7 +28,7 @@ services:
       - BROKER_ID=2
       - BROKER_PORT=:9000
       - MY_ADDR=${ADDR_BROKER_2}
-      - SEED_ADDR=${SEED_ADDR}
+      - SEED_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_3},${ADDR_BROKER_4}
     networks:
       - ormuz-net
 
@@ -48,7 +44,23 @@ services:
       - BROKER_ID=3
       - BROKER_PORT=:9000
       - MY_ADDR=${ADDR_BROKER_3}
-      - SEED_ADDR=${SEED_ADDR}
+      - SEED_ADDRS=${ADDR_BROKER_2},${ADDR_BROKER_1},${ADDR_BROKER_4}
+    networks:
+      - ormuz-net
+
+  broker4:
+    build:
+      context: .
+      args:
+        TARGET: broker
+    container_name: broker-4
+    ports:
+      - "9002:9000"
+    environment:
+      - BROKER_ID=4
+      - BROKER_PORT=:9000
+      - MY_ADDR=${ADDR_BROKER_4}
+      - SEED_ADDRS=${ADDR_BROKER_2},${ADDR_BROKER_3},${ADDR_BROKER_1}
     networks:
       - ormuz-net
 
@@ -59,7 +71,7 @@ services:
         TARGET: sensor
     container_name: sensor-1
     environment:
-      - BROKER_ADDRS=${ADDR_BROKER_1}
+      - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3},${ADDR_BROKER_4}
       - SETOR_ID=1
     networks:
       - ormuz-net
@@ -71,10 +83,11 @@ services:
         TARGET: sensor
     container_name: sensor-2
     environment:
-      - BROKER_ADDRS=${ADDR_BROKER_2}
+      - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3},${ADDR_BROKER_4}
       - SETOR_ID=2
     networks:
       - ormuz-net
+
 
   sensor_setor_3:
     build:
@@ -83,10 +96,24 @@ services:
         TARGET: sensor
     container_name: sensor-3
     environment:
-      - BROKER_ADDRS=${ADDR_BROKER_3}
+      - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3},${ADDR_BROKER_4}
       - SETOR_ID=3
     networks:
       - ormuz-net
+
+
+  sensor_setor_4:
+    build:
+      context: .
+      args:
+        TARGET: sensor
+    container_name: sensor-4
+    environment:
+      - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3},${ADDR_BROKER_4}
+      - SETOR_ID=4
+    networks:
+      - ormuz-net
+
 
   drone_alpha:
     build:
@@ -96,7 +123,7 @@ services:
     container_name: drone-alpha
     environment:
       - DRONE_ID=ALPHA
-      - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3}
+      - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3},${ADDR_BROKER_4}
     networks:
       - ormuz-net
 
@@ -108,19 +135,54 @@ services:
     container_name: drone-bravo
     environment:
       - DRONE_ID=BRAVO
-      - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3}
+      - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3},${ADDR_BROKER_4}
     networks:
       - ormuz-net
 
-  drone_novo:
+  drone_beta:
     build:
       context: .
       args:
         TARGET: drone
-    container_name: drone-novo
+    container_name: drone-beta
     environment:
-      - DRONE_ID=NOVO
+      - DRONE_ID=BRAVO
+      - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3},${ADDR_BROKER_4}
+    networks:
+      - ormuz-net
+
+
+  # -------------------------------------------------------
+  # CLIENTE OPERADOR (terminal interativo)
+  # Uso: docker compose run --rm cliente
+  # -------------------------------------------------------
+  cliente:
+    build:
+      context: .
+      args:
+        TARGET: cliente
+    container_name: cliente
+    stdin_open: true
+    tty: true
+    environment:
       - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3}
+    networks:
+      - ormuz-net
+
+  # -------------------------------------------------------
+  # SUITE DE TESTES AUTOMATIZADOS
+  # Uso: docker compose run --rm testes
+  # -------------------------------------------------------
+  testes:
+    build:
+      context: .
+      args:
+        TARGET: testes
+    container_name: testes
+    environment:
+      - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - ormuz-net
 

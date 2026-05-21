@@ -2,10 +2,7 @@ package models
 
 import "time"
 
-// =========================================================
-// Tipos de mensagem da malha P2P
-// =========================================================
-
+// TipoMensagem identifica o propósito de cada mensagem trocada na malha P2P.
 type TipoMensagem string
 
 const (
@@ -16,14 +13,12 @@ const (
 	MsgFullSync       TipoMensagem = "FULL_SYNC"
 	MsgReqDrone       TipoMensagem = "REQ_DRONE"
 	MsgReplyOK        TipoMensagem = "REPLY_OK"
-	MsgDroneHeartbeat TipoMensagem = "DRONE_HEARTBEAT" // Drone sinaliza que está vivo
-	MsgDroneConcluido TipoMensagem = "DRONE_CONCLUIDO" // Drone concluiu a missão
+	MsgDroneHeartbeat TipoMensagem = "DRONE_HEARTBEAT"
+	MsgDroneConcluido TipoMensagem = "DRONE_CONCLUIDO"
+	MsgConsultaFila   TipoMensagem = "CONSULTA_FILA" // cliente solicita lista de requisições
 )
 
-// =========================================================
-// Status das requisições
-// =========================================================
-
+// StatusRequisicao representa o ciclo de vida de uma missão.
 type StatusRequisicao string
 
 const (
@@ -32,11 +27,7 @@ const (
 	StatusConcluido     StatusRequisicao = "CONCLUIDO"
 )
 
-// =========================================================
-// Estruturas de dados
-// =========================================================
-
-// MensagemDistribuida é o envelope de todas as mensagens P2P.
+// MensagemDistribuida é o envelope JSON de toda comunicação TCP do sistema.
 type MensagemDistribuida struct {
 	Tipo      TipoMensagem `json:"tipo"`
 	SenderID  int          `json:"sender_id"`
@@ -44,7 +35,7 @@ type MensagemDistribuida struct {
 	Payload   interface{}  `json:"payload"`
 }
 
-// Requisicao representa uma missão de drone originada por um sensor.
+// Requisicao representa uma missão criada por um sensor e gerenciada pelos brokers.
 type Requisicao struct {
 	ID              string           `json:"id"`
 	Setor           int              `json:"setor"`
@@ -55,10 +46,12 @@ type Requisicao struct {
 	DroneID         string           `json:"drone_id"`
 	Timestamp       int64            `json:"timestamp"`
 	CreatedAt       time.Time        `json:"created_at"`
-	UltimoHeartbeat time.Time        `json:"ultimo_heartbeat"` // controle de falha de drone
+	IniciadoEm      time.Time        `json:"iniciado_em"`      // preenchido no despacho ao drone
+	UltimoHeartbeat time.Time        `json:"ultimo_heartbeat"` // atualizado a cada heartbeat do drone
 }
 
 // JoinRequest é o payload de MsgJoin e MsgJoinACK.
+// Carrega o ID e o endereço externamente acessível do broker.
 type JoinRequest struct {
 	ID   int    `json:"id"`
 	Addr string `json:"addr"`
@@ -68,4 +61,9 @@ type JoinRequest struct {
 type DroneStatus struct {
 	DroneID   string `json:"drone_id"`
 	MissionID string `json:"mission_id"`
+}
+
+// RespostaFila é o payload de resposta ao MsgConsultaFila.
+type RespostaFila struct {
+	Requisicoes []Requisicao `json:"requisicoes"`
 }
