@@ -13,14 +13,20 @@ import (
 	"time"
 )
 
-// brokerAddrs lista os brokers disponíveis para envio de requisições e consultas.
+// brokerAddrs armazena a lista de endereços dos nós (brokers) disponíveis
+// na malha P2P para roteamento de requisições e consultas de estado.
 var brokerAddrs []string
 
+// main inicializa o nó cliente (Operador).
+// Realiza o parsing das variáveis de ambiente para descoberta dos brokers,
+// inicializa o gerador de entropia para IDs aleatórios e inicia o loop da CLI (REPL).
 func main() {
 	addrsRaw := os.Getenv("BROKER_ADDRS")
 	if addrsRaw == "" {
 		addrsRaw = "broker-1:9000,broker-2:9000,broker-3:9000"
 	}
+
+	// Popula a lista de nós disponíveis para a rotina de failover
 	for _, a := range strings.Split(addrsRaw, ",") {
 		brokerAddrs = append(brokerAddrs, strings.TrimSpace(a))
 	}
@@ -60,7 +66,8 @@ func main() {
 	}
 }
 
-// exibirMenu imprime o menu principal do terminal do operador.
+// exibirMenu renderiza a interface de texto (CLI) com as rotinas operacionais
+// disponíveis para a administração da malha.
 func exibirMenu() {
 	fmt.Println()
 	fmt.Println("  ┌──────────────────────────────────────┐")
@@ -74,7 +81,8 @@ func exibirMenu() {
 	fmt.Println("  └──────────────────────────────────────┘")
 }
 
-// enviarRequisicaoManual permite ao operador escolher descrição e prioridade.
+// enviarRequisicaoManual coleta parâmetros via stdin (tipo, prioridade e setor),
+// instancia a estrutura models.Requisicao e invoca o despachante de rede.
 func enviarRequisicaoManual(scanner *bufio.Scanner) {
 	fmt.Println()
 	fmt.Println("  ── NOVA REQUISIÇÃO MANUAL ──────────────────────────────────")
@@ -89,6 +97,8 @@ func enviarRequisicaoManual(scanner *bufio.Scanner) {
 	for _, a := range alertas {
 		fmt.Printf("     %s\n", a)
 	}
+
+	// Coleta e validação do payload da missão
 	fmt.Print("  Escolha o tipo de alerta (1-5): ")
 	scanner.Scan()
 	tipoStr := strings.TrimSpace(scanner.Text())
@@ -123,6 +133,7 @@ func enviarRequisicaoManual(scanner *bufio.Scanner) {
 		return
 	}
 
+	// Instanciação da requisição com status primário
 	req := models.Requisicao{
 		ID:         fmt.Sprintf("REQ-%d-%04d", setor, rand.Intn(10000)),
 		Setor:      setor,
@@ -135,7 +146,8 @@ func enviarRequisicaoManual(scanner *bufio.Scanner) {
 	enviar(req)
 }
 
-// enviarRequisicaoAleatoria gera e envia uma requisição com valores aleatórios.
+// enviarRequisicaoAleatoria gera um payload estocástico de models.Requisicao.
+// Utilizado primariamente para simulação de eventos em testes unitários ou de integração.
 func enviarRequisicaoAleatoria() {
 	descricoes := []string{
 		"Embarcação à deriva detectada",
@@ -156,7 +168,8 @@ func enviarRequisicaoAleatoria() {
 	enviar(req)
 }
 
-// enviarMultiplasRequisicoes envia N requisições aleatórias para teste de carga.
+// enviarMultiplasRequisicoes executa uma rotina de injeção sequencial de pacotes
+// na malha (Load Testing) com controle de vazão (delay) para evitar saturação TCP.
 func enviarMultiplasRequisicoes(scanner *bufio.Scanner) {
 	fmt.Print("\n  Quantas requisições enviar? ")
 	scanner.Scan()
@@ -168,12 +181,14 @@ func enviarMultiplasRequisicoes(scanner *bufio.Scanner) {
 	fmt.Printf("\n  Enviando %d requisições...\n", n)
 	for i := 0; i < n; i++ {
 		enviarRequisicaoAleatoria()
-		time.Sleep(300 * time.Millisecond) // pequeno intervalo para não sobrecarregar
+		time.Sleep(300 * time.Millisecond)
 	}
 	fmt.Printf("  ✓ %d requisições enviadas.\n", n)
 }
 
-// enviar envia uma requisição para o primeiro broker disponível e exibe o resultado.
+// enviar executa a rotina de Failover iterando sobre os nós registrados (brokerAddrs).
+// Ao estabelecer a conexão TCP, realiza o marshalling do payload para JSON e transmite
+// sob o protocolo interno MsgSyncNew.
 func enviar(req models.Requisicao) {
 	prioLabel := strings.Repeat("★", req.Prioridade) + strings.Repeat("☆", 5-req.Prioridade)
 	fmt.Println()
@@ -183,18 +198,23 @@ func enviar(req models.Requisicao) {
 	fmt.Printf("  │ Setor: %-2d  Prioridade: %s                         │\n", req.Setor, prioLabel)
 	fmt.Println("  └─────────────────────────────────────────────────────────┘")
 
+	// Lógica de resiliência: tenta conexão com o primeiro nó responsivo da lista
 	for _, addr := range brokerAddrs {
 		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 		if err != nil {
 			fmt.Printf("  ✗ Broker %s indisponível\n", addr)
 			continue
 		}
+
+		// Empacotamento para o padrão de mensagens distribuídas
 		envelope := models.MensagemDistribuida{
 			Tipo:      models.MsgSyncNew,
 			SenderID:  req.Setor,
 			Timestamp: 0,
 			Payload:   req,
 		}
+
+		// Transmissão via socket
 		if err := json.NewEncoder(conn).Encode(envelope); err != nil {
 			conn.Close()
 			fmt.Printf("  ✗ Falha ao enviar para %s\n", addr)
@@ -204,11 +224,11 @@ func enviar(req models.Requisicao) {
 		fmt.Printf("  ✓ Requisição enviada para broker %s\n", addr)
 		return
 	}
-	fmt.Println("  ✗ ERRO: nenhum broker disponível!")
+	fmt.Println("  ✗ ERRO: nenhum broker disponível para recebimento da requisição!")
 }
 
-// consultarFila solicita a lista de requisições ao primeiro broker disponível
-// e as exibe agrupadas por status.
+// consultarFila executa uma chamada síncrona (RPC-like) ao broker disponível
+// visando obter o snapshot atualizado da ListaDistribuida (estado global).
 func consultarFila() {
 	fmt.Println()
 	fmt.Println("  Consultando fila no broker...")
@@ -219,23 +239,24 @@ func consultarFila() {
 			continue
 		}
 
-		// Envia pedido de consulta
 		msg := models.MensagemDistribuida{
 			Tipo:      models.MsgConsultaFila,
 			SenderID:  0,
 			Timestamp: 0,
 		}
+
+		// Transmite a flag de requisição de estado
 		if err := json.NewEncoder(conn).Encode(msg); err != nil {
 			conn.Close()
 			continue
 		}
 
-		// Lê a resposta (lista de requisições)
+		// Aguarda o processamento remoto e unmarshalling do payload de resposta
 		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 		var resposta models.RespostaFila
 		if err := json.NewDecoder(conn).Decode(&resposta); err != nil {
 			conn.Close()
-			fmt.Println("  ✗ Falha ao ler resposta do broker.")
+			fmt.Println("  ✗ Falha ao decodificar a estrutura de resposta do broker.")
 			return
 		}
 		conn.Close()
@@ -243,13 +264,16 @@ func consultarFila() {
 		exibirFila(resposta.Requisicoes, addr)
 		return
 	}
-	fmt.Println("  ✗ Nenhum broker disponível para consulta.")
+	fmt.Println("  ✗ Nenhum broker disponível para consulta do estado global.")
 }
 
-// exibirFila formata e imprime a lista de requisições agrupada por status.
+// exibirFila processa o array de requisições retornadas pelo nó,
+// classificando-as e renderizando os agrupamentos com base no
+// ciclo de vida atual (Pendente, Em Atendimento, Concluído).
 func exibirFila(lista []models.Requisicao, broker string) {
 	fmt.Printf("\n  ╔══ FILA DE REQUISIÇÕES — %s (%d missões) ══╗\n", broker, len(lista))
 
+	// Indexação das requisições por status
 	grupos := map[models.StatusRequisicao][]models.Requisicao{
 		models.StatusPendente:      {},
 		models.StatusEmAtendimento: {},
@@ -270,6 +294,7 @@ func exibirFila(lista []models.Requisicao, broker string) {
 		models.StatusConcluido:     "✓",
 	}
 
+	// Renderização tabular dos status particionados
 	for _, status := range ordemStatus {
 		reqs := grupos[status]
 		if len(reqs) == 0 {
@@ -289,7 +314,7 @@ func exibirFila(lista []models.Requisicao, broker string) {
 	}
 
 	if len(lista) == 0 {
-		fmt.Println("  │ Fila vazia — nenhuma requisição registrada.")
+		fmt.Println("  │ Fila vazia — nenhuma requisição processada ou pendente no cluster.")
 	}
 	fmt.Println("\n  ╚══════════════════════════════════════════════════════╝")
 }

@@ -1,4 +1,15 @@
+# ==============================================================================
+# SISTEMA DISTRIBUÍDO: ESTREITO DE ORMUZ
+# Arquitetura baseada em Microserviços e Topologia P2P (Peer-to-Peer)
+# ==============================================================================
+
 services:
+
+  # ============================================================================
+  # CAMADA DE ORQUESTRAÇÃO E CONSENSO (BROKERS P2P)
+  # Nós responsáveis por manter o estado global, gerenciar a fila de missões
+  # e executar o algoritmo de exclusão mútua distribuída (Ricart-Agrawala).
+  # ============================================================================
 
   broker1:
     build:
@@ -6,12 +17,14 @@ services:
       args:
         TARGET: broker
     container_name: broker-1
+    # Port Binding: Exposição TCP para interconexão de rede host-to-container
     ports:
       - "9000:9000"
     environment:
       - BROKER_ID=1
       - BROKER_PORT=:9000
       - MY_ADDR=${ADDR_BROKER_1}
+      # Topologia em malha fechada: Inicialização aponta para os demais peers
       - SEED_ADDRS=${ADDR_BROKER_2},${ADDR_BROKER_3},${ADDR_BROKER_4}
     networks:
       - ormuz-net
@@ -39,12 +52,12 @@ services:
         TARGET: broker
     container_name: broker-3
     ports:
-      - "9003:9000"
+      - "9002:9000"
     environment:
       - BROKER_ID=3
       - BROKER_PORT=:9000
       - MY_ADDR=${ADDR_BROKER_3}
-      - SEED_ADDRS=${ADDR_BROKER_2},${ADDR_BROKER_1},${ADDR_BROKER_4}
+      - SEED_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_4}
     networks:
       - ormuz-net
 
@@ -55,14 +68,20 @@ services:
         TARGET: broker
     container_name: broker-4
     ports:
-      - "9002:9000"
+      - "9003:9000"
     environment:
       - BROKER_ID=4
       - BROKER_PORT=:9000
       - MY_ADDR=${ADDR_BROKER_4}
-      - SEED_ADDRS=${ADDR_BROKER_2},${ADDR_BROKER_3},${ADDR_BROKER_1}
+      - SEED_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3}
     networks:
       - ormuz-net
+
+  # ============================================================================
+  # CAMADA DE TELEMETRIA (SENSORES MARÍTIMOS)
+  # Produtores de eventos (Event Producers). Injetam anomalias estocásticas
+  # no cluster utilizando roteamento de Failover (lista de endpoints).
+  # ============================================================================
 
   sensor_setor_1:
     build:
@@ -83,11 +102,10 @@ services:
         TARGET: sensor
     container_name: sensor-2
     environment:
-      - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3},${ADDR_BROKER_4}
+      - BROKER_ADDRS=${ADDR_BROKER_2},${ADDR_BROKER_1},${ADDR_BROKER_3},${ADDR_BROKER_4}
       - SETOR_ID=2
     networks:
       - ormuz-net
-
 
   sensor_setor_3:
     build:
@@ -96,11 +114,10 @@ services:
         TARGET: sensor
     container_name: sensor-3
     environment:
-      - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3},${ADDR_BROKER_4}
+      - BROKER_ADDRS=${ADDR_BROKER_3},${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_4}
       - SETOR_ID=3
     networks:
       - ormuz-net
-
 
   sensor_setor_4:
     build:
@@ -109,11 +126,16 @@ services:
         TARGET: sensor
     container_name: sensor-4
     environment:
-      - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3},${ADDR_BROKER_4}
+      - BROKER_ADDRS=${ADDR_BROKER_4},${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3}
       - SETOR_ID=4
     networks:
       - ormuz-net
 
+  # ============================================================================
+  # CAMADA DE TRABALHO (AGENTES DRONES)
+  # Nós Workers autônomos. Realizam "Polling" contínuo na infraestrutura de
+  # brokers para alocação de missões e emitem sinais de TTL (Heartbeats).
+  # ============================================================================
 
   drone_alpha:
     build:
@@ -146,22 +168,23 @@ services:
         TARGET: drone
     container_name: drone-beta
     environment:
-      - DRONE_ID=BRAVO
+      - DRONE_ID=BETA
       - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3},${ADDR_BROKER_4}
     networks:
       - ormuz-net
 
+  # ============================================================================
+  # INTERFACE DE ADMINISTRAÇÃO E TESTES
+  # Ferramentas auxiliares para interação humana e validação de consistência.
+  # ============================================================================
 
-  # -------------------------------------------------------
-  # CLIENTE OPERADOR (terminal interativo)
-  # Uso: docker compose run --rm cliente
-  # -------------------------------------------------------
   cliente:
     build:
       context: .
       args:
         TARGET: cliente
     container_name: cliente
+    # TTY/Stdin abertos para habilitar REPL interativo via 'docker compose run'
     stdin_open: true
     tty: true
     environment:
@@ -169,10 +192,6 @@ services:
     networks:
       - ormuz-net
 
-  # -------------------------------------------------------
-  # SUITE DE TESTES AUTOMATIZADOS
-  # Uso: docker compose run --rm testes
-  # -------------------------------------------------------
   testes:
     build:
       context: .
@@ -181,11 +200,17 @@ services:
     container_name: testes
     environment:
       - BROKER_ADDRS=${ADDR_BROKER_1},${ADDR_BROKER_2},${ADDR_BROKER_3}
+    # Montagem do Docker Socket: Permite ao contêiner de testes manipular
+    # o daemon local para rotinas de Engenharia do Caos (derrubar outros nós)
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
       - ormuz-net
 
+# ==============================================================================
+# TOPOLOGIA VIRTUAL
+# ==============================================================================
 networks:
   ormuz-net:
+    # Rede em bridge garante isolamento da stack do host com resolução de DNS interno
     driver: bridge

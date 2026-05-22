@@ -10,16 +10,24 @@ import (
 	"time"
 )
 
+// =========================================================
+// Ponto de Entrada (Agente Autônomo)
+// =========================================================
+
+// main inicializa o nó Worker (Drone), realiza o bind das variáveis de ambiente
+// e inicia o loop principal de Polling para requisição de carga de trabalho (Missões).
 func main() {
 	droneID := os.Getenv("DRONE_ID")
 	if droneID == "" {
 		droneID = "DRONE-01"
 	}
 
+	// Extração da topologia do cluster para roteamento de requisições
 	brokerAddrs := strings.Split(os.Getenv("BROKER_ADDRS"), ",")
 
 	fmt.Printf(">>> [DRONE %s] Online\n", droneID)
 
+	// Loop infinito de Polling: O drone busca continuamente por recursos liberados
 	for {
 		sucesso := false
 		for _, addr := range brokerAddrs {
@@ -30,20 +38,22 @@ func main() {
 				continue
 			}
 
-			// Solicita missão ao broker
+			// Transmissão da intenção de alocação de missão ao cluster
 			envelope := models.MensagemDistribuida{
 				Tipo:     models.MsgReqDrone,
-				SenderID: 0,
+				SenderID: 0, // Sender 0 identifica agentes externos à malha P2P
 				Payload:  droneID,
 			}
 			json.NewEncoder(conn).Encode(envelope)
 
-			// Aguarda decisão do Ricart-Agrawala (broker pode demorar até 5s + margem)
+			// Aguarda a resolução do consenso distribuído (Ricart-Agrawala).
+			// O Timeout reflete a latência esperada para o fechamento do quórum entre os brokers.
 			conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 			var tarefa models.Requisicao
 			err = json.NewDecoder(conn).Decode(&tarefa)
 			conn.Close()
 
+			// Validação da obtenção do Lock (Missão concedida)
 			if err == nil && tarefa.ID != "" {
 				executarMissao(droneID, tarefa, brokerAddrs)
 				sucesso = true
@@ -51,15 +61,21 @@ func main() {
 			}
 		}
 
+		// Backoff delay caso a fila esteja vazia ou a rede indisponível
 		if !sucesso {
 			time.Sleep(5 * time.Second)
 		}
 	}
 }
 
-// executarMissao simula o trabalho do drone enviando heartbeats periódicos ao broker.
-// Se o broker não receber heartbeat por 15s, devolve a missão à fila automaticamente.
+// =========================================================
+// Máquina de Estado e Execução
+// =========================================================
+
+// executarMissao simula o tempo de processamento da tarefa baseando-se no nível de prioridade.
+// Instancia rotinas concorrentes para manutenção do estado de sessão (Keep-Alive) no cluster.
 func executarMissao(id string, t models.Requisicao, brokerAddrs []string) {
+	// Cálculo heurístico de duração baseado na urgência (Prioridade)
 	tempoTotal := time.Duration(10+(t.Prioridade*3)) * time.Second
 
 	fmt.Printf("\n╔═══════════════════════════════════════════════════════╗\n")
@@ -74,8 +90,11 @@ func executarMissao(id string, t models.Requisicao, brokerAddrs []string) {
 
 	inicio := time.Now()
 
-	// Goroutine de heartbeat: avisa o broker que o drone ainda está vivo
+	// Contexto de cancelamento via Channel para a rotina de sinalização
 	done := make(chan struct{})
+
+	// Goroutine dedicada ao envio de sinais Keep-Alive (Heartbeats)
+	// Previne que os mecanismos Watchdog dos brokers efetuem o Rollback da missão
 	go func() {
 		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
@@ -89,7 +108,10 @@ func executarMissao(id string, t models.Requisicao, brokerAddrs []string) {
 		}
 	}()
 
+	// Bloqueio síncrono simulando a operação física
 	time.Sleep(tempoTotal)
+
+	// Sinalização de término para encerramento da Goroutine de Heartbeat
 	close(done)
 
 	fmt.Printf("[DRONE %s] ✓ Missão concluída: \"%s\" (Setor %d) em %v\n",
@@ -98,8 +120,13 @@ func executarMissao(id string, t models.Requisicao, brokerAddrs []string) {
 	enviarConclusao(id, t.ID, brokerAddrs)
 }
 
-// enviarHeartbeat sinaliza ao broker que o drone ainda está ativo na missão.
-// Tenta cada broker na lista até conseguir enviar para pelo menos um.
+// =========================================================
+// Comunicação de Rede e Resiliência
+// =========================================================
+
+// enviarHeartbeat transmite pacotes de vitalidade (TTL Refresh) para a topologia conhecida.
+// Utiliza padrão de Broadcast redundante: tenta notificar todos os nós da lista
+// para garantir a sincronização do estado global mesmo em cenários de partição de rede (NAT/Firewall).
 func enviarHeartbeat(droneID, missionID string, brokerAddrs []string) {
 	for _, addr := range brokerAddrs {
 		conn, err := net.DialTimeout("tcp", strings.TrimSpace(addr), 1*time.Second)
@@ -112,12 +139,12 @@ func enviarHeartbeat(droneID, missionID string, brokerAddrs []string) {
 			Payload:  models.DroneStatus{DroneID: droneID, MissionID: missionID},
 		})
 		conn.Close()
-		// O 'return' que estava aqui foi REMOVIDO para ele avisar toda a malha!
+		// Transmissão mantida em malha aberta (sem return precoce) para máxima resiliência
 	}
 }
 
-// enviarConclusao notifica o broker que a missão foi concluída com sucesso,
-// para que o status seja atualizado na fila distribuída de todos os brokers.
+// enviarConclusao injeta a alteração atômica de status (StatusConcluido) no sistema.
+// Segue a mesma diretriz de tolerância a falhas do Heartbeat, notificando todos os endpoints alcançáveis.
 func enviarConclusao(droneID, missionID string, brokerAddrs []string) {
 	for _, addr := range brokerAddrs {
 		conn, err := net.DialTimeout("tcp", strings.TrimSpace(addr), 2*time.Second)
@@ -130,6 +157,6 @@ func enviarConclusao(droneID, missionID string, brokerAddrs []string) {
 			Payload:  models.DroneStatus{DroneID: droneID, MissionID: missionID},
 		})
 		conn.Close()
-		// O 'return' que estava aqui foi REMOVIDO também!
+		// Transmissão mantida em malha aberta para máxima resiliência
 	}
 }
