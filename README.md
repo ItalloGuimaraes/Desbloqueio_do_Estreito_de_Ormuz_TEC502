@@ -146,3 +146,7 @@ docker compose run --rm cliente
 
 Desenvolvido por **Ítallo de Santana Guimarães**  
 Engenharia de Computação - Universidade Estadual de Feira de Santana (UEFS).
+
+## 📄 Licença
+
+Este projeto está licenciado sob a Licença MIT - veja o arquivo [LICENSE](LICENSE) para mais detalhes.
